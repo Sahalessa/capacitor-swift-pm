@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Set-Cookie parsing correction — build Capacitor 8.5.2 + the one-function cookie-parser correction as xcframeworks.
+#
+# This mirrors `build-cap` from ionic-team/capacitor-swift-pm at tag 8.5.2
+# (commit 0b6882e9a3288342aacf36348e5a94e4f1dd7b13) step for step, with three deliberate,
+# output-neutral deviations, each recorded in the build record:
+#   1. no `git clone` / `git checkout` here — the checkout is a verified git worktree of
+#      ionic-team/capacitor at 5e0f67871994fec94e413cd0993dc6cd495431f7 (tag 8.5.2) with the
+#      Set-Cookie parsing patch applied; the script REFUSES to build unless the checkout is at exactly that
+#      commit, the patched file has exactly the expected hash, and nothing else is modified;
+#   2. `-derivedDataPath` under the build root, so no local user name reaches the shipped dSYMs
+#      (the official artifact embeds /Users/runner/... in its dSYMs the same way);
+#   3. no xcframework code-signing step — upstream CI signs with Ionic's Developer ID
+#      certificate, which is not ours to use; the SPM checksum pinned in Package.swift is the
+#      integrity control instead.
+# Everything else — schemes, configurations, destinations, build settings, the removal of the
+# nested Frameworks directories, and -create-xcframework with dSYMs — is upstream's, verbatim.
+set -eoux pipefail
+
+BUILD_ROOT=/Users/Shared/capacitor-build
+CHECKOUT="$BUILD_ROOT/capacitor-checkout"
+DERIVED="$BUILD_ROOT/DerivedData"
+EXPECTED_COMMIT=5e0f67871994fec94e413cd0993dc6cd495431f7
+PATCHED_FILE=ios/Capacitor/Capacitor/Plugins/HttpRequestHandler.swift
+EXPECTED_PATCHED_SHA=ccd8404b29d2bc46d187698be22b293786b149ea11b69316e80e20184cf45664
+
+# The only paths this script deletes are under the literal build root; refuse anything else.
+case "$BUILD_ROOT" in
+	/Users/Shared/capacitor-build) ;;
+	*) echo "REFUSING: unexpected BUILD_ROOT '$BUILD_ROOT'"; exit 67 ;;
+esac
+
+date -u +%Y-%m-%dT%H:%M:%SZ
+sw_vers
+xcodebuild -version
+xcrun swift --version
+
+cd "$CHECKOUT"
+echo "== source state at build time =="
+HEAD_NOW=$(git rev-parse HEAD)
+echo "$HEAD_NOW"
+git status --porcelain
+git diff --stat
+FILE_SHA=$(shasum -a 256 "$PATCHED_FILE" | cut -c1-64)
+echo "$FILE_SHA  $PATCHED_FILE"
+MODIFIED_COUNT=$(git status --porcelain | wc -l | tr -d ' ')
+if [ "$HEAD_NOW" != "$EXPECTED_COMMIT" ]; then
+	echo "REFUSING: checkout is at $HEAD_NOW, expected $EXPECTED_COMMIT"; exit 64
+fi
+if [ "$FILE_SHA" != "$EXPECTED_PATCHED_SHA" ]; then
+	echo "REFUSING: $PATCHED_FILE is $FILE_SHA, expected the patched $EXPECTED_PATCHED_SHA"; exit 65
+fi
+if [ "$MODIFIED_COUNT" != "1" ]; then
+	echo "REFUSING: expected exactly one modified file (the patch), found $MODIFIED_COUNT"; exit 66
+fi
+
+cd "$CHECKOUT/ios/Capacitor"
+rm -rf ./Build "$DERIVED" ./Capacitor.xcframework ./Cordova.xcframework
+
+build_simulator() {
+	local SCHEME=$1
+	xcodebuild archive \
+		-scheme $SCHEME \
+		-workspace Capacitor.xcworkspace \
+		-destination "generic/platform=iOS Simulator" \
+		-configuration Debug \
+		-archivePath ./Build/$SCHEME-iOS-Simulator \
+		-derivedDataPath "$DERIVED" \
+		SKIP_INSTALL=NO \
+		BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
+		DEBUG_INFORMATION_FORMAT="dwarf-with-dsym"
+}
+
+build_ios() {
+	local SCHEME=$1
+	xcodebuild archive \
+		-scheme $SCHEME \
+		-workspace Capacitor.xcworkspace \
+		-destination "generic/platform=iOS" \
+		-archivePath ./Build/$SCHEME-iOS \
+		-derivedDataPath "$DERIVED" \
+		SKIP_INSTALL=NO \
+		SWIFT_SERIALIZE_DEBUGGING_OPTIONS=NO \
+		DEBUG_INFORMATION_FORMAT="dwarf-with-dsym" \
+		BUILD_LIBRARY_FOR_DISTRIBUTION=YES
+}
+
+create_xcframeworks() {
+	build_simulator Capacitor
+	build_simulator Cordova
+
+	build_ios Capacitor
+	build_ios Cordova
+
+	rm -rf ./Build/Capacitor-iOS-Simulator.xcarchive/Products/Library/Frameworks/Capacitor.framework/Frameworks
+	rm -rf ./Build/Capacitor-iOS.xcarchive/Products/Library/Frameworks/Capacitor.framework/Frameworks
+
+	xcodebuild -create-xcframework \
+		-framework ./Build/Capacitor-iOS-Simulator.xcarchive/Products/Library/Frameworks/Capacitor.framework \
+		-debug-symbols $PWD/Build/Capacitor-iOS-Simulator.xcarchive/dSYMs/Capacitor.framework.dSYM \
+		-framework ./Build/Capacitor-iOS.xcarchive/Products/Library/Frameworks/Capacitor.framework \
+		-debug-symbols $PWD/Build/Capacitor-iOS.xcarchive/dSYMs/Capacitor.framework.dSYM \
+		-output Capacitor.xcframework
+
+	xcodebuild -create-xcframework \
+		-framework ./Build/Cordova-iOS-Simulator.xcarchive/Products/Library/Frameworks/Cordova.framework \
+		-debug-symbols $PWD/Build/Cordova-iOS-Simulator.xcarchive/dSYMs/Cordova.framework.dSYM \
+		-framework ./Build/Cordova-iOS.xcarchive/Products/Library/Frameworks/Cordova.framework \
+		-debug-symbols $PWD/Build/Cordova-iOS.xcarchive/dSYMs/Cordova.framework.dSYM \
+		-output Cordova.xcframework
+}
+
+create_xcframeworks
+
+rm -rf "$BUILD_ROOT/Capacitor.xcframework" "$BUILD_ROOT/Cordova.xcframework"
+mv Capacitor.xcframework "$BUILD_ROOT/"
+mv Cordova.xcframework "$BUILD_ROOT/"
+
+echo "== source state after the build (must be unchanged) =="
+cd "$CHECKOUT"
+git status --porcelain
+git diff --stat
+date -u +%Y-%m-%dT%H:%M:%SZ
+echo "BUILD-COOKIEFIX OK"

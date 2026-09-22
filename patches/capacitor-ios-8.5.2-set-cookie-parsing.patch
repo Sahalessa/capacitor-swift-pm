@@ -1,0 +1,31 @@
+--- a/ios/Capacitor/Capacitor/Plugins/HttpRequestHandler.swift
++++ b/ios/Capacitor/Capacitor/Plugins/HttpRequestHandler.swift
+@@ -121,18 +121,16 @@
+     }
+ 
+     public static func setCookiesFromResponse(_ response: HTTPURLResponse, _ config: InstanceConfiguration?) {
+-        let headers = response.allHeaderFields
+-        if let cookies = headers["Set-Cookie"] as? String {
+-            for cookie in cookies.components(separatedBy: ",") {
+-                let domainComponents = cookie.lowercased().components(separatedBy: "domain=")
+-                if domainComponents.count > 1 {
+-                    CapacitorCookieManager(config).setCookie(
+-                        domainComponents[1].components(separatedBy: ";")[0],
+-                        cookie
+-                    )
+-                } else {
+-                    CapacitorCookieManager(config).setCookie("", cookie)
+-                }
++        // Never split the header on commas: an RFC Expires= date contains one, and splitting there
++        // discards HttpOnly, Path, SameSite and the expiry from the stored cookie (and, with no
++        // Domain=, re-stores the fragment against the app's own local URL, where the WebView's
++        // document.cookie can read it). Foundation parses the response's own fields comma-safely and
++        // scopes each cookie to the response URL - host-only when no Domain= is present - exactly as
++        // a browser would.
++        if let url = response.url, let fields = response.allHeaderFields as? [String: String] {
++            let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: url)
++            if !cookies.isEmpty {
++                HTTPCookieStorage.shared.setCookies(cookies, for: url, mainDocumentURL: nil)
+             }
+         }
+         CapacitorCookieManager(config).syncCookiesToWebView()
